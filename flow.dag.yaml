@@ -1,0 +1,154 @@
+$schema: https://azuremlschemas.azureedge.net/promptflow/latest/Flow.schema.json
+
+environment:
+  python_requirements_txt: requirements.txt
+
+# Optional top-level inputs if you want to parametrize the file path:
+inputs:
+  file_path:
+    type: string
+    default: ./vmsaudit.csv
+
+# Optional top-level outputs referencing your final step's output
+outputs:
+  final_table:
+    type: string
+    reference: ${show_results.output}
+
+nodes:
+- name: store_instructions
+  type: python
+  source:
+    type: inline
+    script: |
+      instructions_text = r'''
+Purpose & Overview
+... your instructions ...
+'''
+      context['instructions'] = instructions_text
+  outputs:
+    - name: instructions
+      type: string
+
+- name: file_input
+  type: python
+  source:
+    type: inline
+    script: |
+      import os
+      # Use the top-level input
+      file_path = inputs['file_path']
+      context['file_data'] = file_path
+  outputs:
+    - name: file_data
+      type: string
+
+- name: parse_file
+  type: python
+  source:
+    type: inline
+    script: |
+      import pandas as pd
+      file_path = context['file_data']
+      df = pd.read_excel(file_path)
+      df = df.dropna(subset=['Description of Requirement'])
+      data_records = df.to_dict(orient='records')
+      total_rows = len(data_records)
+      context['parsedData'] = data_records
+      context['total_rows'] = total_rows
+  # Use new-style referencing for inputs if you want:
+  # inputs:
+  #   file_data: ${file_input.outputs.file_data}
+  outputs:
+    - name: parsedData
+      type: object
+    - name: total_rows
+      type: number
+
+- name: process_rows
+  type: foreach
+  items: ${parse_file.outputs.parsedData}
+  nodes:
+    - name: search_policy
+      type: python
+      source:
+        type: inline
+        script: |
+          row = context['item']
+          requirement_text = row.get("Description of Requirement", "")
+
+          def call_search_api(query):
+              # ...
+              return {"results": [{"PolicyNumber": "OP-INT-001", "SectionNumber": "2.3"}]}
+
+          search_results = call_search_api(requirement_text)
+          context['searchResults'] = search_results
+      outputs:
+        - name: searchResults
+          type: object
+
+    - name: map_requirements
+      type: llm
+      model:
+        type: azure_openai
+        name: gpt-35-turbo
+        deployment_name: gpt-35-deployment
+      inputs:
+        # referencing the instructions from store_instructions
+        system_prompt: ${store_instructions.outputs.instructions}
+        user_prompt: |
+          The total_rows is: ${parse_file.outputs.total_rows}
+
+          Row Data:
+          ${item}
+
+          Search Results:
+          ${search_policy.outputs.searchResults}
+
+          Please follow all instructions from the system prompt.
+          Return JSON with keys: ...
+      outputs:
+        - name: rowResult
+          type: string
+
+- name: gather_results
+  type: gather
+  from: ${process_rows.map_requirements.outputs.rowResult}
+  outputs:
+    - name: allRowResults
+      type: list
+
+- name: finalize_output
+  type: python
+  source:
+    type: inline
+    script: |
+      import json, pandas as pd
+
+      results_raw = context['allRowResults']
+      final_list = []
+      for r in results_raw:
+          try:
+              parsed = json.loads(r)
+              final_list.append(parsed)
+          except:
+              pass
+
+      df_final = pd.DataFrame(final_list)
+      needed_cols = ["RowNumber","OriginalRequirement","VMSPolicyNumber","SectionNumber","ExactExtract"]
+      for c in needed_cols:
+          if c not in df_final.columns:
+              df_final[c] = "No relevant policy found"
+
+      final_output = df_final.to_csv(index=False)
+      context['final_table'] = final_output
+  inputs:
+    allRowResults: ${gather_results.outputs.allRowResults}
+  outputs:
+    - name: final_table
+      type: string
+
+- name: show_results
+  type: end
+  inputs:
+    output: ${finalize_output.outputs.final_table}
